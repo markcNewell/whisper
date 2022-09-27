@@ -88,7 +88,7 @@ def transcribe(
     task = decode_options.get("task", "transcribe")
     tokenizer = get_tokenizer(model.is_multilingual, language=language, task=task)
 
-    def decode_with_fallback(segment: torch.Tensor) -> List[DecodingResult]:
+    def decode_with_fallback(segment: torch.Tensor) -> List[List[DecodingResult]]:
         temperatures = [temperature] if isinstance(temperature, (int, float)) else temperature
         kwargs = {**decode_options}
         t = temperatures[0]
@@ -104,7 +104,7 @@ def transcribe(
         kwargs.pop("patience", None)  # no patience for t > 0
         kwargs["best_of"] = best_of  # enable best_of for t > 0
         for t in temperatures[1:]:
-            needs_fallback = [
+            needs_fallback: List[bool] = [
                 compression_ratio_threshold is not None
                 and result.compression_ratio > compression_ratio_threshold
                 or logprob_threshold is not None
@@ -131,9 +131,13 @@ def transcribe(
     prompt_reset_since = 0
 
     def add_segment(
-        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, text_tokens: torch.Tensor, results: DecodingResult
     ):
-        text = tokenizer.decode([token for token in text_tokens if token < tokenizer.eot])
+        texts = []
+        for tokens in text_tokens:
+            text = tokenizer.decode([token for token in tokens if token < tokenizer.eot])
+            texts.append(text)
+
         if len(text.strip()) == 0:  # skip empty text output
             return
 
@@ -143,12 +147,12 @@ def transcribe(
                 "seek": seek,
                 "start": start,
                 "end": end,
-                "text": text,
-                "tokens": result.tokens,
-                "temperature": result.temperature,
-                "avg_logprob": result.avg_logprob,
-                "compression_ratio": result.compression_ratio,
-                "no_speech_prob": result.no_speech_prob,
+                "text": texts,
+                "tokens": [result.tokens for result in results],
+                "temperature": [result.temperature for result in results],
+                "avg_logprob": [result.avg_logprob for result in results],
+                "compression_ratio": [result.compression_ratio for result in results],
+                "no_speech_prob": [result.no_speech_prob for result in results]
             }
         )
         if verbose:
@@ -160,13 +164,14 @@ def transcribe(
         segment_duration = segment.shape[-1] * HOP_LENGTH / SAMPLE_RATE
 
         decode_options["prompt"] = all_tokens[prompt_reset_since:]
-        result = decode_with_fallback(segment)[0]
-        tokens = torch.tensor(result.tokens)
+        results = decode_with_fallback(segment)
+
+        tokens = [torch.tensor(result.tokens) for result in results]
 
         if no_speech_threshold is not None:
             # no voice activity check
-            should_skip = result.no_speech_prob > no_speech_threshold
-            if logprob_threshold is not None and result.avg_logprob > logprob_threshold:
+            should_skip = results[0].no_speech_prob > no_speech_threshold
+            if logprob_threshold is not None and any([result.avg_logprob > logprob_threshold for result in results]):
                 # don't skip if the logprob is high enough, despite the no_speech_prob
                 should_skip = False
 
@@ -174,33 +179,38 @@ def transcribe(
                 seek += segment.shape[-1]  # fast-forward to the next segment boundary
                 continue
 
-        timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
-        consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
+        timestamp_tokens: List[torch.Tensor[bool]] = [token.ge(tokenizer.timestamp_begin) for token in tokens]
+        consecutive: List[bool] = [torch.where(t[:-1] & t[1:])[0].add_(1) for t in timestamp_tokens][0]
+
+        # Decided that we will sort by logprob and the first result will be the 'main' one.
+        # All the following calculations will be done on that main result but will return
+        # multiple options for the tensor and text so further analysis can be done.
+
         if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
             last_slice = 0
             for current_slice in consecutive:
-                sliced_tokens = tokens[last_slice:current_slice]
+                sliced_tokens = [token[last_slice:current_slice] for token in tokens]
                 start_timestamp_position = (
-                    sliced_tokens[0].item() - tokenizer.timestamp_begin
+                    sliced_tokens[0][0].item() - tokenizer.timestamp_begin
                 )
                 end_timestamp_position = (
-                    sliced_tokens[-1].item() - tokenizer.timestamp_begin
+                    sliced_tokens[0][-1].item() - tokenizer.timestamp_begin
                 )
                 add_segment(
                     start=timestamp_offset + start_timestamp_position * time_precision,
                     end=timestamp_offset + end_timestamp_position * time_precision,
-                    text_tokens=sliced_tokens[1:-1],
-                    result=result,
+                    text_tokens=[sliced_token[1:-1] for sliced_token in sliced_tokens],
+                    results=results,
                 )
                 last_slice = current_slice
             last_timestamp_position = (
-                tokens[last_slice - 1].item() - tokenizer.timestamp_begin
+                tokens[0][last_slice - 1].item() - tokenizer.timestamp_begin
             )
             seek += last_timestamp_position * input_stride
-            all_tokens.extend(tokens[: last_slice + 1].tolist())
+            all_tokens.extend(tokens[0][: last_slice + 1].tolist())
         else:
             duration = segment_duration
-            timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+            timestamps = tokens[0][timestamp_tokens[0].nonzero().flatten()]
             if len(timestamps) > 0:
                 # no consecutive timestamps but it has a timestamp; use the last one.
                 # single timestamp at the end means no speech after the last timestamp.
@@ -211,13 +221,13 @@ def transcribe(
                 start=timestamp_offset,
                 end=timestamp_offset + duration,
                 text_tokens=tokens,
-                result=result,
+                results=results,
             )
 
             seek += segment.shape[-1]
-            all_tokens.extend(tokens.tolist())
+            all_tokens.extend(tokens[0].tolist())
 
-        if result.temperature > 0.5:
+        if any(result.temperature for result in results) > 0.5:
             # do not feed the prompt tokens if a high temperature was used
             prompt_reset_since = len(all_tokens)
 

@@ -608,7 +608,7 @@ class DecodingTask:
         return tokens, sum_logprobs, no_speech_probs
 
     @torch.no_grad()
-    def run(self, mel: Tensor) -> List[DecodingResult]:
+    def run(self, mel: Tensor) -> List[List[DecodingResult]]:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
@@ -645,31 +645,32 @@ class DecodingTask:
             [t[self.sample_begin : (t == tokenizer.eot).nonzero()[0, 0]] for t in s] for s in tokens
         ]
 
-        # select the top-ranked sample in each group
-        selected = self.sequence_ranker.rank(tokens, sum_logprobs)
-        tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
+        # Adding the indexing here as it was later in the code before but no need
+        tokens: List[int] = [t.tolist() for t in tokens[0]]
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
 
-        sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
-        avg_logprobs: List[float] = [lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)]
+        languages: List[str] = [languages[0] for _ in texts]
+        audio_features: List[str] = [audio_features[0] for _ in texts]
+        sum_logprobs: List[str] = sum_logprobs[0]
+        no_speech_probs: List[str] = [no_speech_probs[0] for _ in texts]
 
-        fields = (texts, languages, tokens, audio_features, avg_logprobs, no_speech_probs)
+        fields = (texts, languages, tokens, audio_features, sum_logprobs, no_speech_probs)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
-        return [
+        return sorted([
             DecodingResult(
                 audio_features=features,
                 language=language,
                 tokens=tokens,
                 text=text,
-                avg_logprob=avg_logprob,
+                avg_logprob=sum_logprobs,
                 no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
             )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(*fields)
-        ]
+            for text, language, tokens, features, sum_logprobs, no_speech_prob in zip(*fields)
+        ], key=lambda x: -x.avg_logprob)
 
 
 @torch.no_grad()
