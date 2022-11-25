@@ -104,6 +104,7 @@ class DecodingOptions:
 class DecodingResult:
     audio_features: Tensor
     language: str
+    probabilities: List[float]
     language_probs: Optional[Dict[str, float]] = None
     tokens: List[int] = field(default_factory=list)
     text: str = ""
@@ -282,6 +283,7 @@ class BeamSearchDecoder(TokenDecoder):
         self.patience = patience
         self.max_candidates: int = round(beam_size * (1.0 + patience))
         self.finished_sequences = None
+        self.finished_probabilities = None
 
     def reset(self):
         self.finished_sequences = None
@@ -293,9 +295,10 @@ class BeamSearchDecoder(TokenDecoder):
         n_audio = tokens.shape[0] // self.beam_size
         if self.finished_sequences is None:  # for the first update
             self.finished_sequences = [{} for _ in range(n_audio)]
+            self.finished_probabilities = {}
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
-        next_tokens, source_indices, finished_sequences = [], [], []
+        next_tokens, source_indices, finished_sequences, prefixes = [], [], [], []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
 
@@ -306,8 +309,16 @@ class BeamSearchDecoder(TokenDecoder):
                 for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
                     new_logprob = (sum_logprobs[idx] + logprob).item()
                     sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
                     sources[sequence] = idx
+                    scores[sequence] = new_logprob
+
+                    try:
+                        self.finished_probabilities[sequence] = self.finished_probabilities[tuple(prefix)].copy()
+                        self.finished_probabilities[sequence].append(new_logprob)
+                    except:
+                        self.finished_probabilities[sequence] = [new_logprob]
+
+                prefixes.append(prefix)
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
             saved = 0
@@ -316,6 +327,7 @@ class BeamSearchDecoder(TokenDecoder):
                     finished[sequence] = scores[sequence]
                 else:
                     sum_logprobs[len(next_tokens)] = scores[sequence]
+
                     next_tokens.append(sequence)
                     source_indices.append(sources[sequence])
 
@@ -324,6 +336,12 @@ class BeamSearchDecoder(TokenDecoder):
                         break
 
             finished_sequences.append(finished)
+
+        for pre in prefixes:
+            try:
+                del self.finished_probabilities[tuple(pre)]   
+            except:
+                continue    
 
         tokens = torch.tensor(next_tokens, device=tokens.device)
         self.inference.rearrange_kv_cache(source_indices)
@@ -356,10 +374,13 @@ class BeamSearchDecoder(TokenDecoder):
         tokens: List[List[Tensor]] = [
             [torch.tensor(seq) for seq in sequences.keys()] for sequences in self.finished_sequences
         ]
+        probabilities: List[List[Tensor]] = [
+            [torch.tensor(self.finished_probabilities[seq]) for seq in sequences.keys()] for sequences in self.finished_sequences
+        ]
         sum_logprobs: List[List[float]] = [
             list(sequences.values()) for sequences in self.finished_sequences
         ]
-        return tokens, sum_logprobs
+        return tokens, probabilities, sum_logprobs
 
 
 class LogitFilter:
@@ -640,12 +661,13 @@ class DecodingTask:
         sum_logprobs = sum_logprobs.reshape(n_audio, self.n_group)
 
         # get the final candidates for each group, and slice between the first sampled token and EOT
-        tokens, sum_logprobs = self.decoder.finalize(tokens, sum_logprobs)
+        tokens, probabilities, sum_logprobs = self.decoder.finalize(tokens, sum_logprobs)
         tokens: List[List[Tensor]] = [
             [t[self.sample_begin : (t == tokenizer.eot).nonzero()[0, 0]] for t in s] for s in tokens
         ]
 
         # Adding the indexing here as it was later in the code before but no need
+        probabilities: List[float] = [p.tolist() for p in probabilities[0]]
         tokens: List[int] = [t.tolist() for t in tokens[0]]
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
 
@@ -654,7 +676,7 @@ class DecodingTask:
         sum_logprobs: List[str] = sum_logprobs[0]
         no_speech_probs: List[str] = [no_speech_probs[0] for _ in texts]
 
-        fields = (texts, languages, tokens, audio_features, sum_logprobs, no_speech_probs)
+        fields = (texts, languages, tokens, audio_features, sum_logprobs, no_speech_probs, probabilities)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
@@ -668,8 +690,9 @@ class DecodingTask:
                 no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
+                probabilities=probs
             )
-            for text, language, tokens, features, sum_logprobs, no_speech_prob in zip(*fields)
+            for text, language, tokens, features, sum_logprobs, no_speech_prob, probs in zip(*fields)
         ], key=lambda x: -x.avg_logprob)
 
 

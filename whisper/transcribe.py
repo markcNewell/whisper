@@ -111,6 +111,8 @@ def transcribe(
                 and result.avg_logprob < logprob_threshold
                 for result in results
             ]
+
+            # TODO: Broken
             if any(needs_fallback):
                 options = DecodingOptions(**kwargs, temperature=t)
                 retries = model.decode(segment[needs_fallback], options)
@@ -152,7 +154,8 @@ def transcribe(
                 "temperature": [result.temperature for result in results],
                 "avg_logprob": [result.avg_logprob for result in results],
                 "compression_ratio": [result.compression_ratio for result in results],
-                "no_speech_prob": [result.no_speech_prob for result in results]
+                "no_speech_prob": [result.no_speech_prob for result in results],
+                "probabilities": [result.probabilities for result in results]
             }
         )
         if verbose:
